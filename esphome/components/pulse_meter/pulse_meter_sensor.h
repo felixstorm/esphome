@@ -7,6 +7,11 @@
 
 #include <cinttypes>
 
+// ISR debugging only (defined(tskKERNEL_VERSION_NUMBER) => FreeRTOS and QueueHandle_t exist)
+#if defined(USE_LOGGER) && ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERY_VERBOSE && defined(tskKERNEL_VERSION_NUMBER)
+#define USE_PM_ISR_DEBUG_LOGGING
+#endif
+
 namespace esphome {
 namespace pulse_meter {
 
@@ -65,6 +70,26 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
   uint32_t last_intr_ = 0;
   bool in_pulse_ = false;
   bool last_pin_val_ = false;
+
+#ifdef USE_PM_ISR_DEBUG_LOGGING
+  // ISR debugging only
+  struct IsrStateSnapshot {
+    struct IsrStateValues {
+      uint32_t last_edge_candidate_us_ = 0;
+      uint32_t last_intr_ = 0;
+      bool last_pin_val_ = false;
+      bool in_pulse_ = false;
+      State set_;
+    };
+    uint32_t time = 0;
+    uint32_t time_since_last = 0;
+    bool pin_val = false;
+    IsrStateValues on_enter;
+    int8_t state_machine = 0;
+    IsrStateValues on_exit;
+  };
+  QueueHandle_t isr_logger_queue_ = nullptr;
+#endif
 };
 
 }  // namespace pulse_meter

@@ -21,6 +21,10 @@ void PulseMeterSensor::setup() {
   // Set the last processed edge to now for the first timeout
   this->last_processed_edge_us_ = micros();
 
+#ifdef USE_PM_ISR_DEBUG_LOGGING
+  this->isr_logger_queue_ = xQueueCreate(50, sizeof(IsrStateSnapshot));
+#endif
+
   if (this->filter_mode_ == FILTER_EDGE) {
     this->pin_->attach_interrupt(PulseMeterSensor::edge_intr, this, gpio::INTERRUPT_RISING_EDGE);
   } else if (this->filter_mode_ == FILTER_PULSE) {
@@ -29,6 +33,24 @@ void PulseMeterSensor::setup() {
 }
 
 void PulseMeterSensor::loop() {
+#ifdef USE_PM_ISR_DEBUG_LOGGING
+  IsrStateSnapshot isr_state_snapshot;
+  while (xQueueReceive(this->isr_logger_queue_, &isr_state_snapshot, 0) == pdPASS) {
+    ESP_LOGV(TAG,
+             "'%s': ISR state (on_enter/on_exit) at %u micros: time_since_last = %d, pin_val = %d, "
+             "last_intr_ = %d / %d,  last_pin_val_ = %d / %d, in_pulse_ = %d / %d, last_edge_candidate_us_ = %d / %d, "
+             "set_.last_detected_edge_us_ = %d / %d, set_.count_ = %d / %d, state_machine = %d",
+             this->get_name().c_str(), isr_state_snapshot.time, isr_state_snapshot.time_since_last,
+             isr_state_snapshot.pin_val, isr_state_snapshot.on_enter.last_intr_, isr_state_snapshot.on_exit.last_intr_,
+             isr_state_snapshot.on_enter.last_pin_val_, isr_state_snapshot.on_exit.last_pin_val_,
+             isr_state_snapshot.on_enter.in_pulse_, isr_state_snapshot.on_exit.in_pulse_,
+             isr_state_snapshot.on_enter.last_edge_candidate_us_, isr_state_snapshot.on_exit.last_edge_candidate_us_,
+             isr_state_snapshot.on_enter.set_.last_detected_edge_us_,
+             isr_state_snapshot.on_exit.set_.last_detected_edge_us_, isr_state_snapshot.on_enter.set_.count_,
+             isr_state_snapshot.on_exit.set_.count_, isr_state_snapshot.state_machine);
+  }
+#endif
+
   // Reset the count in get before we pass it back to the ISR as set
   this->get_->count_ = 0;
 
@@ -103,11 +125,26 @@ void IRAM_ATTR PulseMeterSensor::edge_intr(PulseMeterSensor *sensor) {
   // Get the current time before we do anything else so the measurements are consistent
   const uint32_t now = micros();
 
+#ifdef USE_PM_ISR_DEBUG_LOGGING
+  IsrStateSnapshot isr_state_snapshot;
+  isr_state_snapshot.time = now;
+  isr_state_snapshot.time_since_last = now - sensor->last_edge_candidate_us_;
+  isr_state_snapshot.on_enter.last_edge_candidate_us_ = sensor->last_edge_candidate_us_;
+#endif
+
   if ((now - sensor->last_edge_candidate_us_) >= sensor->filter_us_) {
     sensor->last_edge_candidate_us_ = now;
     sensor->set_->last_detected_edge_us_ = now;
     sensor->set_->count_++;
+#ifdef USE_PM_ISR_DEBUG_LOGGING
+    isr_state_snapshot.state_machine = 2;
+#endif
   }
+
+#ifdef USE_PM_ISR_DEBUG_LOGGING
+  isr_state_snapshot.on_exit.last_edge_candidate_us_ = sensor->last_edge_candidate_us_;
+  xQueueSendFromISR(sensor->isr_logger_queue_, &isr_state_snapshot, NULL);
+#endif
 }
 
 void IRAM_ATTR PulseMeterSensor::pulse_intr(PulseMeterSensor *sensor) {
@@ -116,12 +153,28 @@ void IRAM_ATTR PulseMeterSensor::pulse_intr(PulseMeterSensor *sensor) {
   const uint32_t now = micros();
   const bool pin_val = sensor->isr_pin_.digital_read();
 
+#ifdef USE_PM_ISR_DEBUG_LOGGING
+  IsrStateSnapshot isr_state_snapshot;
+  isr_state_snapshot.time = now;
+  isr_state_snapshot.time_since_last = now - sensor->last_intr_;
+  isr_state_snapshot.pin_val = pin_val;
+  isr_state_snapshot.on_enter.last_edge_candidate_us_ = sensor->last_edge_candidate_us_;
+  isr_state_snapshot.on_enter.last_intr_ = sensor->last_intr_;
+  isr_state_snapshot.on_enter.last_pin_val_ = sensor->last_pin_val_;
+  isr_state_snapshot.on_enter.in_pulse_ = sensor->in_pulse_;
+  isr_state_snapshot.on_enter.set_.last_detected_edge_us_ = sensor->set_->last_detected_edge_us_;
+  isr_state_snapshot.on_enter.set_.count_ = sensor->set_->count_;
+#endif
+
   // A pulse occurred faster than we can detect
   if (sensor->last_pin_val_ == pin_val) {
     // If we haven't reached the filter length yet we need to reset our last_intr_ to now
     // otherwise we can consider this noise as the "pulse" was certainly less than filter_us_
     if (now - sensor->last_intr_ < sensor->filter_us_) {
       sensor->last_intr_ = now;
+#ifdef USE_PM_ISR_DEBUG_LOGGING
+      isr_state_snapshot.state_machine = -1;
+#endif
     }
   } else {
     // Check if the last interrupt was long enough in the past
@@ -130,18 +183,34 @@ void IRAM_ATTR PulseMeterSensor::pulse_intr(PulseMeterSensor *sensor) {
       if (!sensor->in_pulse_ && sensor->last_pin_val_) {
         sensor->last_edge_candidate_us_ = sensor->last_intr_;
         sensor->in_pulse_ = true;
+#ifdef USE_PM_ISR_DEBUG_LOGGING
+        isr_state_snapshot.state_machine = 1;
+#endif
       }
       // Low pulse of filter length now rising (therefore last_intr_ was the falling edge)
       else if (sensor->in_pulse_ && !sensor->last_pin_val_) {
         sensor->set_->last_detected_edge_us_ = sensor->last_edge_candidate_us_;
         sensor->set_->count_++;
         sensor->in_pulse_ = false;
+#ifdef USE_PM_ISR_DEBUG_LOGGING
+        isr_state_snapshot.state_machine = 2;
+#endif
       }
     }
 
     sensor->last_intr_ = now;
     sensor->last_pin_val_ = pin_val;
   }
+
+#ifdef USE_PM_ISR_DEBUG_LOGGING
+  isr_state_snapshot.on_exit.last_edge_candidate_us_ = sensor->last_edge_candidate_us_;
+  isr_state_snapshot.on_exit.last_intr_ = sensor->last_intr_;
+  isr_state_snapshot.on_exit.last_pin_val_ = sensor->last_pin_val_;
+  isr_state_snapshot.on_exit.in_pulse_ = sensor->in_pulse_;
+  isr_state_snapshot.on_exit.set_.last_detected_edge_us_ = sensor->set_->last_detected_edge_us_;
+  isr_state_snapshot.on_exit.set_.count_ = sensor->set_->count_;
+  xQueueSendFromISR(sensor->isr_logger_queue_, &isr_state_snapshot, NULL);
+#endif
 }
 
 }  // namespace pulse_meter
