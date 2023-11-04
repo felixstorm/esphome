@@ -28,6 +28,8 @@ void PulseMeterSensor::setup() {
   if (this->filter_mode_ == FILTER_EDGE) {
     this->pin_->attach_interrupt(PulseMeterSensor::edge_intr, this, gpio::INTERRUPT_RISING_EDGE);
   } else if (this->filter_mode_ == FILTER_PULSE) {
+    // Ensure to not ignore the first edge by thinking that it was the same value as last and therefore too fast
+    this->last_pin_val_ = this->pin_->digital_read();
     this->pin_->attach_interrupt(PulseMeterSensor::pulse_intr, this, gpio::INTERRUPT_ANY_EDGE);
   }
 }
